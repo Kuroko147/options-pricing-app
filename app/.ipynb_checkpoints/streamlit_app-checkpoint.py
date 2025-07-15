@@ -9,15 +9,19 @@ import pandas as pd
 from streamlit import dataframe, expander
 import numpy as np
 import matplotlib.pyplot as plt
+import traceback
+import plotly.graph_objects as go
 from pricing.black_scholes import black_scholes_price
 from pricing.binomial_tree import binomial_tree_price
 from pricing.greeks import compute_greeks
 from pricing.implied_volatility import implied_volatility
 from utils.plot_utilis import plot_volatility_smile
 from strategies.payoff_composer import combined_strategy_payoff
-from tests.test_pricing import fetch_option_chain_with_iv, OPTIONABLE_TICKERS
 from pricing.monte_carlo import monte_carlo_option_price
 from utils.sanity_checks import run_all_checks_scenario
+from tests.test_pricing import fetch_option_chain_with_iv, TICKERS 
+from strategies.strategy_detector import detect_strategy, analyze_strategy
+
 
 # --- CIR simulation function ---
 def simulate_cir_v_paths(v0, kappa, theta, sigma, T, N, M, seed=None):
@@ -60,31 +64,6 @@ def plot_payoff(ax, S, K, premium, option_type, title, breakeven=None):
     ax.legend()
     ax.grid(True)
 
-def plot_greek_sensitivity_vs_S(axs, S, K, T, r, sigma, option_type, q):
-    S_vals = np.linspace(0.5 * S, 1.5 * S, 50)
-    keys = ['Delta', 'Gamma', 'Vega', 'Theta', 'Rho']
-    greek_vals = {k: [] for k in keys}
-    for s_val in S_vals:
-        g = compute_greeks(s_val, K, T, r, sigma, option_type, q)
-        for k in keys:
-            greek_vals[k].append(g[k])
-    for i, k in enumerate(keys):
-        axs[i].plot(S_vals, greek_vals[k])
-        axs[i].set_title(f"{k} vs Stock Price")
-        axs[i].grid(True)
-
-def plot_greek_sensitivity_vs_sigma(axs, S, K, T, r, sigma, option_type, q):
-    sig_vals = np.linspace(0.01, 3 * sigma, 50)
-    keys = ['Delta', 'Gamma', 'Vega', 'Theta', 'Rho']
-    greek_vals = {k: [] for k in keys}
-    for sig in sig_vals:
-        g = compute_greeks(S, K, T, r, sig, option_type, q)
-        for k in keys:
-            greek_vals[k].append(g[k])
-    for i, k in enumerate(keys):
-        axs[i].plot(sig_vals, greek_vals[k])
-        axs[i].set_title(f"{k} vs Volatility")
-        axs[i].grid(True)
 
 def plot_binomial_convergence(ax, S, K, T, r, sigma, option_type, q, american, max_steps):
     steps = list(range(10, max_steps + 1, 10))
@@ -312,36 +291,6 @@ if st.session_state.run_comparison:
             st.session_state.pop('mc_price_2', None)
     
 
-    # --- Greek Sensitivity vs Stock Price ---
-    st.markdown("---")
-    st.subheader("Greek Sensitivity vs Stock Price")
-    col_gs1, col_gs2 = st.columns(2)
-    for i, (col, S, K, T, r, sigma, option_type, q) in enumerate(
-        [(col_gs1, S1, K1, T1, r1, sigma1_used, option_type_1, q1),
-         (col_gs2, S2, K2, T2, r2, sigma2_used, option_type_2, q2)]):
-        with col:
-            st.markdown(f"**Scenario {i+1}**")
-            fig, axs = plt.subplots(5, 1, figsize=(6, 12))
-            plot_greek_sensitivity_vs_S(axs, S, K, T, r, sigma, option_type, q)
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-
-    # --- Greek Sensitivity vs Volatility ---
-    st.markdown("---")
-    st.subheader("Greek Sensitivity vs Volatility")
-    col_vs1, col_vs2 = st.columns(2)
-    for i, (col, S, K, T, r, sigma, option_type, q) in enumerate(
-        [(col_vs1, S1, K1, T1, r1, sigma1_used, option_type_1, q1),
-         (col_vs2, S2, K2, T2, r2, sigma2_used, option_type_2, q2)]):
-        with col:
-            st.markdown(f"**Scenario {i+1}**")
-            fig, axs = plt.subplots(5, 1, figsize=(6, 12))
-            plot_greek_sensitivity_vs_sigma(axs, S, K, T, r, sigma, option_type, q)
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-
     if not american:
         st.markdown("---")
         st.subheader("🔁 Put-Call Parity Check (European Options Only)")
@@ -392,11 +341,11 @@ if st.session_state.run_comparison:
             st.pyplot(fig)
             plt.close(fig)
 
+
     # --- Volatility Smile Plot---
 
 
     st.markdown("---")
-    st.subheader("📈 Volatility Smile Analysis")
 
 with st.expander("Show Volatility Smile Tool"):
     st.markdown("Enter a list of strike prices and market prices to visualize the implied volatility smile.")
@@ -423,147 +372,276 @@ with st.expander("Show Volatility Smile Tool"):
     except Exception as e:
         st.warning(f"Invalid input or error computing smile: {e}")
 
-    # --- Strategy Builder ---
 
 
-    st.markdown("---")
+# --- Strategy Builder ---
+st.markdown("---")
+with st.expander("Option Payoff Builder"):
+# --- Option Strategy Input Section ---
     st.subheader("🧮 Option Strategy Payoff Builder")
-
-
-with st.expander("🧮 Option Strategy Payoff Builder"):
-    st.markdown("Add Multiple legs (long, short calls/puts) to simulate your strategy.")
-
-    num_legs = st.number_input("Number of Option Legs", min_value=1, max_value=5, value=2, step=1, key="strategy_num_legs")
-
+    
+    # Strategy dropdown
+    selected_strategy = st.selectbox(
+        "Select Strategy to auto-fill legs (or choose Custom Strategy)",
+        ["Custom Strategy", "Bull Call Spread", "Bear Put Spread", "Long Straddle",
+         "Short Straddle", "Long Strangle", "Short Strangle", "Bull Put Spread", "Bear Call Spread"]
+    )
+    
     legs = []
-    for i in range(num_legs):       
-        st.markdown(f"### Leg {i + 1}")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            opt_type = st.selectbox(f"Type {i+1}", ["call", "put"], key=f"leg_type_{i}")
-        with col2:
-            strike = st.number_input(f"Strike (K{i+1})", min_value=0.01, value=100.0, key=f"leg_K_{i}")
-        with col3:
-            premium = st.number_input(f"Premium (Leg {i+1})", min_value=0.0, value=5.0, step=0.1, key=f"leg_prem_{i}")
-        with col4:
-            position = st.selectbox(f"Position {i+1}", ["Long", "Short"], key=f"leg_pos_{i}")
-        legs.append({
-            "type": opt_type,
-            "K": strike,
-            "premium": premium,
-            "position": 1 if position == "Long" else -1
-        })
-
-    S = st.number_input("Spot Price (S)", min_value=0.01, value=100.0, key="strategy_spot")
-    S_range = np.linspace(0.5 * S, 1.5 * S, 200)
-    payoff = combined_strategy_payoff(legs, S_range)
     
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(S_range, payoff, label="Strategy Payoff", color='blue')
-    ax.axhline(0, color='black', linewidth=0.8)
-    ax.axvline(S, linestyle="--", color='gray', label=f"Spot: {S:.2f}")
-    ax.set_title("Total Strategy Payoff at Expiration")
-    ax.set_xlabel("Underlying Price at Expiry")
-    ax.set_ylabel("Net P&L")
-    ax.grid(True)
-    ax.legend()
-    st.pyplot(fig)
-    plt.close(fig)
+    # --- Custom Strategy Input ---
+    if selected_strategy == "Custom Strategy":
+        num_legs = st.number_input("Number of Option Legs", min_value=1, max_value=5, value=2, step=1)
     
-    net_premium = sum([leg["premium"] * -leg["position"] for leg in legs])
-    max_profit = np.max(payoff)
-    max_loss = np.min(payoff)
+        for i in range(num_legs):
+            st.markdown(f"### Leg {i+1}")
+            option_type = st.selectbox(f"Type {i+1}", ["call", "put"], key=f"type_{i}")
+            strike = st.number_input(f"Strike (K{i+1})", value=100.0, step=1.0, key=f"strike_{i}")
+            premium = st.number_input(f"Premium (Leg {i+1})", value=5.0, step=0.5, key=f"premium_{i}")
+            position_str = st.selectbox(f"Position {i+1}", ["Long", "Short"], key=f"position_{i}")
+            position = 1 if position_str == "Long" else -1
     
-    breakeven_points = []
-    for i in range(1, len(S_range)):
-        if np.sign(payoff[i - 1]) != np.sign(payoff[i]):
-            x1, x2 = S_range[i - 1], S_range[i]
-            y1, y2 = payoff[i - 1], payoff[i]
-            if y2 - y1 != 0:
-                x_zero = x1 - y1 * (x2 - x1) / (y2 - y1)
-                breakeven_points.append(x_zero)
+            legs.append({
+                "type": option_type,
+                "strike": strike,
+                "premium": premium,
+                "position": position
+            })
     
-        st.markdown("### 💡 Cost & Breakeven")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.write(f"**Net Premium Paid:** {net_premium:.2f}")
-        with col_b:
-            if breakeven_points:
-                breakeven_str = ", ".join([f"{x:.2f}" for x in breakeven_points])
-                st.write(f"**Breakeven Point(s):** {breakeven_str}")
-            else:
-                st.write("**Breakeven Point(s):** Not detected")
+    # --- Predefined Strategies ---
+    else:
+        if selected_strategy == "Bull Call Spread":
+            legs = [
+                {"type": "call", "strike": 95, "premium": 7, "position": 1},
+                {"type": "call", "strike": 105, "premium": 3, "position": -1}
+            ]
+        elif selected_strategy == "Bear Put Spread":
+            legs = [
+                {"type": "put", "strike": 105, "premium": 8, "position": 1},
+                {"type": "put", "strike": 95, "premium": 4, "position": -1}
+            ]
+        elif selected_strategy == "Long Straddle":
+            legs = [
+                {"type": "call", "strike": 100, "premium": 6, "position": 1},
+                {"type": "put", "strike": 100, "premium": 5, "position": 1}
+            ]
+        elif selected_strategy == "Short Straddle":
+            legs = [
+                {"type": "call", "strike": 100, "premium": 6, "position": -1},
+                {"type": "put", "strike": 100, "premium": 5, "position": -1}
+            ]
+        elif selected_strategy == "Long Strangle":
+            legs = [
+                {"type": "put", "strike": 95, "premium": 3, "position": 1},
+                {"type": "call", "strike": 105, "premium": 4, "position": 1}
+            ]
+        elif selected_strategy == "Short Strangle":
+            legs = [
+                {"type": "put", "strike": 95, "premium": 3, "position": -1},
+                {"type": "call", "strike": 105, "premium": 4, "position": -1}
+            ]
+        elif selected_strategy == "Bull Put Spread":
+            legs = [
+                {"type": "put", "strike": 95, "premium": 2, "position": -1},
+                {"type": "put", "strike": 105, "premium": 5, "position": 1}
+            ]
+        elif selected_strategy == "Bear Call Spread":
+            legs = [
+                {"type": "call", "strike": 95, "premium": 2, "position": -1},
+                {"type": "call", "strike": 105, "premium": 5, "position": 1}
+            ]
+    
+        # Display strategy legs
+        st.markdown("### Pre-filled Legs for Selected Strategy")
+        for i, leg in enumerate(legs):
+            position_label = "Long" if leg["position"] == 1 else "Short"
+            st.markdown(
+                f"**Leg {i+1}:** {position_label} {leg['type'].title()} | "
+                f"Strike: {leg['strike']} | Premium: {leg['premium']}"
+            )
+            
+        # --- Spot Price Input ---
+    spot_price = st.number_input("Spot Price (S)", value=100.0, step=1.0)
+    
+    # Analyze the strategy
+    analysis = analyze_strategy(legs)
+    
+    # Calculate payoff
+    x = np.linspace(spot_price * 0.5, spot_price * 1.5, 100)
+    payoff = np.zeros_like(x)
+    
+    for leg in legs:
+        if leg["type"] == "call":
+            leg_payoff = np.maximum(x - leg["strike"], 0)
+        else:
+            leg_payoff = np.maximum(leg["strike"] - x, 0)
+        leg_payoff = leg["position"] * (leg_payoff - leg["premium"])
+        payoff += leg_payoff
+    
+    # Plot payoff chart
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=payoff, mode="lines", name="Strategy Payoff", line=dict(color='blue')))
+    fig.add_vline(x=spot_price, line_dash="dash", line_color="gray",
+                  annotation_text="Spot", annotation_position="top left")
+    fig.update_layout(
+        title="Options Strategy Payoff",
+        xaxis_title="Spot Price at Expiry",
+        yaxis_title="Net P&L",
+        template="plotly_white",
+        showlegend=False
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Show payoff table
+    table_df = pd.DataFrame({
+        "Spot Price": np.round(x, 2),
+        "Total Payoff": np.round(payoff, 2)
+    })
+    st.dataframe(table_df)
+    
+    if analysis:
+        st.markdown(f"### 🔍 Detected Strategy: {analysis['strategy']}")
+    
+        net_premium = analysis['net_premium']
+        if net_premium >= 0:
+            st.markdown(f"**Net Premium Received:** {net_premium:.2f}")
+        else:
+            st.markdown(f"**Net Premium Paid:** {-net_premium:.2f}")
+    
+        max_profit = analysis['max_profit']
+        max_loss = analysis['max_loss']
+        breakeven = analysis['breakeven']
+    
+        max_profit_str = f"{max_profit:.2f}" if max_profit is not None and max_profit != float('inf') else "Unlimited"
+        max_loss_str = f"{max_loss:.2f}" if max_loss is not None and max_loss != float('inf') else "Unlimited"
+    
+        if len(breakeven) == 1:
+            breakeven_str = f"{breakeven[0]:.2f}"
+        else:
+            breakeven_str = " and ".join(f"{b:.2f}" for b in breakeven)
     
         st.markdown("### 📊 Strategy Summary")
-        st.write(f"**Max Profit (Est.):** {max_profit:.2f}")
-        st.write(f"**Max Loss (Est.):** {max_loss:.2f}")
+        st.markdown(f"**Max Profit (Est.):** {max_profit_str}")
+        st.markdown(f"**Max Loss (Est.):** {max_loss_str}")
+        st.markdown(f"**Breakeven Point(s):** {breakeven_str}")
+    else:
+        st.info("Strategy not recognized or unsupported. Showing general payoff only.")
 
+        
 
-
-def format_and_display_options(df, option_type="Option"):
-    if df.empty:
-        st.info(f"No {option_type} data available.")
-        return
-
-    df = df.copy()
-    # Format IV as percentage or N/A
-    df['impliedVol'] = df['impliedVol'].apply(lambda x: f"{x*100:.2f}%" if pd.notnull(x) else "N/A")
-
-    moneyness_options = df['moneyness'].unique().tolist()
-    selected_moneyness = st.multiselect(f"Filter {option_type} by Moneyness", options=moneyness_options, default=moneyness_options)
-
-    filtered_df = df[df['moneyness'].isin(selected_moneyness)]
-
-    st.dataframe(filtered_df[['strike', 'lastPrice', 'impliedVol', 'moneyness']])
-
+# 🔧 UI: Category and Ticker Selection
 
 st.markdown("---")
-st.subheader("📡 Real-Time Option Chain Viewer")
+with st.expander("Real-Time Option Data"):
 
-# Select country first
-country = st.selectbox("Select Country (US-listed stocks & ADRs)", list(OPTIONABLE_TICKERS.keys()))
-tickers = OPTIONABLE_TICKERS[country]
-
-ticker = st.selectbox("Select Ticker", tickers)
-
-r_live = st.number_input("Risk-Free Rate (for IV)", min_value=0.0, value=0.05)
-q_live = st.number_input("Dividend Yield", min_value=0.0, value=0.0)
-
-if country != "US":
-    st.warning(
-        "Note: These tickers represent ADRs traded on US exchanges. "
-        "Option chain data is available only for US-listed stocks and ADRs via Yahoo Finance."
-    )
-
-try:
-    # Use yfinance to get expiries dynamically
-    ticker_obj = fetch_option_chain_with_iv.__globals__['yf'].Ticker(ticker)
-    expiries = ticker_obj.options
-except Exception:
-    expiries = []
-
-if expiries:
-    expiry_choices = ["All"] + list(expiries)
-    selected_expiry = st.selectbox("Select Expiry", expiry_choices)
-else:
-    selected_expiry = None
-    st.warning(f"No option chain expiry data found for {ticker}.")
-
-if st.button("Fetch Live Option Chain"):
+    category = st.selectbox("Select Asset Category", list(TICKERS.keys()))
+    tickers = TICKERS[category]
+    ticker = st.selectbox("Select Ticker", tickers)
+    
+    r_live = st.number_input("Risk-Free Rate (for IV)", min_value=0.0, value=0.05)
+    q_live = st.number_input("Dividend Yield", min_value=0.0, value=0.0)
+    
+    # 🔧 Expiry Dropdown Setup
     try:
-        expiry_param = None if selected_expiry == "All" else selected_expiry
-        data = fetch_option_chain_with_iv(ticker, expiry=expiry_param, r=r_live, q=q_live)
+        ticker_obj = fetch_option_chain_with_iv.__globals__['yf'].Ticker(ticker)
+        expiries = ticker_obj.options
+    except Exception:
+        expiries = []
+    
+    if expiries:
+        expiry_choices = ["All"] + list(expiries)
+        selected_expiry = st.selectbox("Select Expiry", expiry_choices)
+    else:
+        selected_expiry = None
+        st.warning(f"No expiry data found for {ticker}.")
+    
+    # 🔧 Display Helper Function
+    def format_and_display_options(df, option_type="Option"):
+        if df.empty:
+            st.info(f"No {option_type} data available.")
+            return
+    
+        df = df.copy()
+    
+        # Ensure OI fields exist
+        if 'openInterest' not in df.columns:
+            df['openInterest'] = 0
+        if 'changeInOpenInterest' not in df.columns:
+            df['changeInOpenInterest'] = 0
+    
+        df['impliedVolFormatted'] = df['impliedVol'].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "N/A")
+        df['openInterest'] = df['openInterest'].fillna(0).astype(int)
+        df['changeInOpenInterest'] = df['changeInOpenInterest'].fillna(0).astype(int)
+    
+        # Moneyness filtering
+        moneyness_options = df['moneyness'].unique().tolist()
+        selected_moneyness = st.multiselect(
+            f"Filter {option_type} by Moneyness", options=moneyness_options, default=moneyness_options,
+            key=f"{option_type}_moneyness"
+        )
+        filtered_df = df[df['moneyness'].isin(selected_moneyness)]
+    
+        # Display dataframe with renamed columns
+        display_df = filtered_df[['strike', 'lastPrice', 'impliedVolFormatted', 'openInterest', 'changeInOpenInterest', 'moneyness', 'expiry']].copy()
+        display_df.columns = ['Strike', 'Last Price', 'Implied Vol', 'Open Interest', 'Change in OI', 'Moneyness', 'Expiry']
+        display_df = display_df.sort_values(by='Strike')
+    
+        st.markdown(f"**Total Open Interest ({option_type}):** {display_df['Open Interest'].sum():,}")
+    
+        # Style Change in OI with colors
+        def color_change(val):
+            if val > 0:
+                return 'color: green'
+            elif val < 0:
+                return 'color: red'
+            return 'color: black'
+    
+        styled_df = display_df.style.applymap(color_change, subset=['Change in OI']) \
+                                   .format({'Last Price': '${:,.2f}', 'Strike': '${:,.2f}'})
+    
+        st.dataframe(styled_df, use_container_width=True)
+    
+        # CSV download button
+        csv = display_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label=f"📥 Download {option_type} Options as CSV",
+            data=csv,
+            file_name=f"{option_type.lower()}_options_{ticker}.csv",
+            mime='text/csv',
+            key=f"{option_type}_csv"
+        )
+    
+        # Charts
+        st.markdown("📊 **Open Interest vs Strike**")
+        st.bar_chart(display_df.set_index("Strike")["Open Interest"])
+    
+        st.markdown("📈 **Implied Volatility vs Strike**")
+        iv_chart_df = display_df[display_df["Implied Vol"] != "N/A"].copy()
+        iv_chart_df["IV Numeric"] = iv_chart_df["Implied Vol"].str.replace('%', '').astype(float)
+        st.line_chart(iv_chart_df.set_index("Strike")["IV Numeric"])
 
-        st.success(f"Fetched live option chain data for **{ticker}**")
-        st.write(f"**Spot Price:** {data['spot']:.2f}")
-
-        st.markdown("### 📞 Call Options")
-        st.dataframe(data['calls'])
-
-        st.markdown("### 📉 Put Options")
-        st.dataframe(data['puts'])
-
-    except Exception as e:
-        st.error(f"Failed to fetch data for {ticker}: {e}")
-else:
-    st.info("Select options and click 'Fetch Live Option Chain' to get data.")
+    
+    # 🔧 Fetch Button Logic
+    if selected_expiry and st.button("📥 Fetch Live Option Chain"):
+        try:
+            expiry_param = None if selected_expiry == "All" else selected_expiry
+            data = fetch_option_chain_with_iv(ticker, expiry=expiry_param, r=r_live, q=q_live)
+    
+            st.success(f"Data fetched for **{ticker}** at spot price **${data['spot']:.2f}**")
+    
+            col1, col2 = st.columns(2)
+    
+            with col1:
+                st.markdown("### 📞 Call Options")
+                format_and_display_options(data['calls'], option_type="Call")
+    
+            with col2:
+                st.markdown("### 📉 Put Options")
+                format_and_display_options(data['puts'], option_type="Put")
+    
+        except Exception as e:
+            fallback = ticker if 'ticker' in locals() else "selected symbol"
+            st.error(f"❌ Failed to fetch data for {fallback}: {e}")
+            st.text(traceback.format_exc())
+    else:
+        st.info("Choose ticker and expiry, then click 'Fetch Live Option Chain'.")
